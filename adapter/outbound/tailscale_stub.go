@@ -2,10 +2,22 @@
 
 package outbound
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 type Tailscale struct {
 	*Base
+}
+
+type TailscaleStatus struct {
+	State   string `json:"state"`
+	AuthURL string `json:"authUrl,omitempty"`
+}
+
+func (t *Tailscale) StartAndStatus(context.Context) (*TailscaleStatus, error) {
+	return nil, fmt.Errorf("tailscale support is disabled")
 }
 
 type TailscaleOption struct {

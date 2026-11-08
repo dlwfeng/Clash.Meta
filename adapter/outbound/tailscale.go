@@ -111,6 +111,13 @@ func init() {
 	}
 }
 
+var (
+	tailscaleNodesMu sync.Mutex
+	// Two tsnet servers on one state directory race its key and log the node
+	// out, so a new config closes the previous one first.
+	tailscaleNodes = map[string]*Tailscale{}
+)
+
 func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	if _, err := buildTailscaleMaskedPrefs(option); err != nil {
 		return nil, err
@@ -121,6 +128,13 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	option.StateDir = C.Path.Resolve(option.StateDir)
 	if !C.Path.IsSafePath(option.StateDir) {
 		return nil, C.Path.ErrNotSafePath(option.StateDir)
+	}
+	tailscaleNodesMu.Lock()
+	previous := tailscaleNodes[option.StateDir]
+	delete(tailscaleNodes, option.StateDir)
+	tailscaleNodesMu.Unlock()
+	if previous != nil {
+		_ = previous.Close()
 	}
 
 	addr := option.ControlURL
@@ -145,6 +159,10 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		backendInitCh: make(chan struct{}),
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
+	// Only the control connection may use dialer-proxy. magicsock binds a
+	// local UDP endpoint of its own, and a proxied packet connection is not
+	// one: binding it fails on Android and the engine cannot start.
+	packetDialer := dialer.NewDialer(outbound.DialOptions()...)
 	outbound.server = &tsnet.Server{
 		Dir:        option.StateDir,
 		Hostname:   option.Hostname,
@@ -159,7 +177,7 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		},
 		SystemPacketListener: func(ctx context.Context, network, address string) (net.PacketConn, error) {
 			log.Debugln("[Tailscale](%s) SystemPacketListener: start listen %s %s", option.Name, network, address)
-			pc, err := outbound.dialer.ListenPacket(ctx, network, address, netip.AddrPort{})
+			pc, err := packetDialer.ListenPacket(ctx, network, address, netip.AddrPort{})
 			log.Debugln("[Tailscale](%s) SystemPacketListener: finish listen %s %s, err: %v", option.Name, network, address, err)
 			return pc, err
 		},
@@ -180,6 +198,9 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	dnsTransport := tailscaleDNSTransport{tailscale: outbound}
 	outbound.dnsResolver = dns.NewResolverFromClient(dnsTransport)
 	outbound.unregisterDNSResolver = dns.RegisterTailscaleDnsClient(option.Name, dnsTransport)
+	tailscaleNodesMu.Lock()
+	tailscaleNodes[option.StateDir] = outbound
+	tailscaleNodesMu.Unlock()
 	return outbound, nil
 }
 
@@ -208,6 +229,39 @@ func (t *Tailscale) ensureStarted(ctx context.Context) error {
 		return err
 	}
 	return t.waitBackendInitialized(ctx)
+}
+
+type TailscaleStatus struct {
+	State   string `json:"state"`
+	AuthURL string `json:"authUrl,omitempty"`
+}
+
+func (t *Tailscale) StartAndStatus(ctx context.Context) (*TailscaleStatus, error) {
+	if err := t.ensureStarted(ctx); err != nil {
+		return nil, err
+	}
+	client, err := t.server.LocalClient()
+	if err != nil {
+		return nil, err
+	}
+	status, err := client.StatusWithoutPeers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Control hands out the login link a moment after the backend reports
+	// NeedsLogin, and the host asks for it only once per tap.
+	deadline := time.Now().Add(10 * time.Second)
+	for status.AuthURL == "" && status.BackendState == ipn.NeedsLogin.String() && time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+		if status, err = client.StatusWithoutPeers(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return &TailscaleStatus{State: status.BackendState, AuthURL: status.AuthURL}, nil
 }
 
 func (t *Tailscale) watchBackendState() {
@@ -465,6 +519,11 @@ func (t *Tailscale) IsL3Protocol(metadata *C.Metadata) bool {
 }
 
 func (t *Tailscale) Close() error {
+	tailscaleNodesMu.Lock()
+	if tailscaleNodes[t.option.StateDir] == t {
+		delete(tailscaleNodes, t.option.StateDir)
+	}
+	tailscaleNodesMu.Unlock()
 	t.cancel()
 	if t.unregisterDNSResolver != nil {
 		t.unregisterDNSResolver()

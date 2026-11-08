@@ -407,6 +407,16 @@ func (p *autoCloseProxyAdapter) Close() error {
 	return p.closeErr
 }
 
+// ProxyAdapterUnwrapper exposes the adapter behind the closing wrapper, so a
+// caller that needs the concrete outbound can reach it.
+type ProxyAdapterUnwrapper interface {
+	UnwrapProxyAdapter() ProxyAdapter
+}
+
+func (p *autoCloseProxyAdapter) UnwrapProxyAdapter() ProxyAdapter {
+	return p.ProxyAdapter
+}
+
 func NewAutoCloseProxyAdapter(adapter ProxyAdapter) ProxyAdapter {
 	proxy := &autoCloseProxyAdapter{
 		ProxyAdapter: adapter,
